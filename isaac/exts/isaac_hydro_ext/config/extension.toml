@@ -1,0 +1,15 @@
+[package]
+version = "0.2.0"
+title = "Isaac Hydro Field"
+description = "Still-water buoyancy and drag on every dynamic rigid body"
+category = "simulation"
+keywords = ["isaac", "hydro", "buoyancy"]
+
+[dependencies]
+"isaacsim.core.simulation_manager" = {}
+"isaacsim.core.experimental.prims" = {}
+"omni.timeline" = {}
+"omni.usd" = {}
+
+[[python.module]]
+name = "isaac_hydro_ext"

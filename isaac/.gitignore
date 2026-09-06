@@ -1,0 +1,30 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+
+# Generated captures and logs
+captures/
+logs/
+*.log
+*.bag
+*.mcap
+
+# Generated simulation/build artifacts
+build/
+dist/
+_build/
+*.blend1
+
+# Editors and OS metadata
+.idea/
+.vscode/
+.cursor/
+.codex/
+.DS_Store
+Thumbs.db
+desktop.ini
