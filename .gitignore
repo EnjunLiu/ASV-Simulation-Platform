@@ -1,0 +1,42 @@
+# Windows and editors
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vs/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Isaac / Omniverse generated state
+isaac/_build/
+isaac/.cache/
+isaac/logs/
+isaac/data/
+isaac/outputs/
+
+# Unreal generated state
+unreal/Binaries/
+unreal/DerivedDataCache/
+unreal/Intermediate/
+unreal/Saved/
+unreal/.vs/
+unreal/*.sln
+
+# Local datasets, models and experiment artifacts
+data/
+datasets/
+models/
+weights/
+checkpoints/
+*.bag
+*.db3
+*.mcap
+*.npz
+*.pt
+*.pth
+*.onnx
