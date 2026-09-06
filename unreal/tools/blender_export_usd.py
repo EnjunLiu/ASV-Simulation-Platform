@@ -5,8 +5,8 @@ StaticMesh. The source .blend is not saved.
 
 Run with Blender's bundled Python, for example:
   blender.exe --background --python tools/blender_export_usd.py -- \
-    --source-blend C:\\assets\\SM_ASV.blend \
-    --asset-root C:\\Users\\LIU\\Desktop\\ASVModels \
+    --source-blend ..\\isaac\\assets\\asv_models\\ASVModel.blend \
+    --asset-root Content\\Assets \
     --asset-name SM_ASV \
     --ue-destination /Game/Assets/ASV/_staging
 """
