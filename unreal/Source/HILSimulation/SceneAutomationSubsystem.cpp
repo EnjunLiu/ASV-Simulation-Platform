@@ -1,0 +1,1188 @@
+#include "SceneAutomationSubsystem.h"
+
+#include "Engine/World.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "EngineUtils.h"
+#include "Components/SceneCaptureComponent2D.h"
+#include "GameFramework/Actor.h"
+#include "HAL/PlatformMisc.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+#include "UObject/UnrealType.h"
+#include "UObject/UObjectIterator.h"
+#include "Protocol/ProtocolTcpIpClient.h"
+#include "RenderingThread.h"
+
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Sockets.h"
+#include "SocketSubsystem.h"
+#include "IPAddress.h"
+#include "Interfaces/IPv4/IPv4Endpoint.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogSceneAutomation, Log, All);
+
+namespace
+{
+struct FTargetBinding
+{
+    FName EntityId;
+    const TCHAR* BlueprintClassName;
+};
+
+const FTargetBinding TargetBindings[] = {
+    {TEXT("target_red"), TEXT("BP_Target_C")},
+    {TEXT("target_blue"), TEXT("BP_Target1_C")},
+    {TEXT("target_left"), TEXT("BP_Target2_C")},
+    {TEXT("target_right"), TEXT("BP_Target3_C")},
+};
+
+FString NormalizePropertyName(FString Value)
+{
+    Value.ReplaceInline(TEXT("_"), TEXT(""));
+    Value.ReplaceInline(TEXT(" "), TEXT(""));
+    Value.ToLowerInline();
+    return Value;
+}
+
+bool MakeLayout(const FString& LayoutId, TMap<FName, FVector>& OutLocations)
+{
+    OutLocations.Reset();
+    if (LayoutId == TEXT("L1"))
+    {
+        OutLocations.Add(TEXT("target_red"), FVector(150.0, 0.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(400.0, 0.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(250.0, -150.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(250.0, 150.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L2"))
+    {
+        OutLocations.Add(TEXT("target_red"), FVector(400.0, 0.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(150.0, 0.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(250.0, -150.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(250.0, 150.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L3"))
+    {
+        OutLocations.Add(TEXT("target_red"), FVector(250.0, -120.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(250.0, 120.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(150.0, -180.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(400.0, 180.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L4"))
+    {
+        OutLocations.Add(TEXT("target_red"), FVector(250.0, 120.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(250.0, -120.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(400.0, -180.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(150.0, 180.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L5"))
+    {
+        // Legacy demo layout: the red target is NEAREST (6 m ahead) so a
+        // "follow red at 3 m" instruction yields a clean forward approach
+        // with the other targets far away (9 m) — the collision margin
+        // stays clear along the whole approach path.
+        OutLocations.Add(TEXT("target_red"), FVector(600.0, 0.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(900.0, 0.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(900.0, -300.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(900.0, 300.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L6"))
+    {
+        // Sine-formation demo layout (motion S2): the red/blue pair starts
+        // 25 m ahead, side by side with 6 m separation (red left, blue
+        // right), and the two white boats sit 35 m ahead on either side as
+        // distractors.  The follower approaches from behind and must select
+        // the commanded colour while both boats are still in the 90 deg FOV.
+        OutLocations.Add(TEXT("target_red"), FVector(2500.0, -300.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(2500.0, 300.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(3500.0, -800.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(3500.0, 800.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L6B"))
+    {
+        // Mirror of L6: red on the right, blue on the left.  Provides the
+        // mirrored geometry needed to verify colour selection both ways.
+        OutLocations.Add(TEXT("target_red"), FVector(2500.0, 300.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(2500.0, -300.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(3500.0, -800.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(3500.0, 800.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L7"))
+    {
+        // Final S2 near-range layout: red and blue start 4.5 m ahead with
+        // +/-100 cm lateral offsets. White distractors sit 7 m ahead with
+        // +/-350 cm lateral offsets, outside the direct target center while
+        // remaining inside the camera FOV.
+        OutLocations.Add(TEXT("target_red"), FVector(450.0, -100.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(450.0, 100.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(700.0, -350.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(700.0, 350.0, 0.0));
+        return true;
+    }
+    if (LayoutId == TEXT("L7B"))
+    {
+        // Mirror of the final S2 near-range layout: swap red and blue while
+        // retaining the same white distractor positions.
+        OutLocations.Add(TEXT("target_red"), FVector(450.0, 100.0, 0.0));
+        OutLocations.Add(TEXT("target_blue"), FVector(450.0, -100.0, 0.0));
+        OutLocations.Add(TEXT("target_left"), FVector(700.0, -350.0, 0.0));
+        OutLocations.Add(TEXT("target_right"), FVector(700.0, 350.0, 0.0));
+        return true;
+    }
+    return false;
+}
+
+TMap<FName, FVector> MakeLocalVelocities(const FString& MotionState, int32 Seed)
+{
+    TMap<FName, FVector> Result;
+    if (MotionState == TEXT("S0"))
+    {
+        for (const FTargetBinding& Binding : TargetBindings)
+        {
+            Result.Add(Binding.EntityId, FVector::ZeroVector);
+        }
+        return Result;
+    }
+
+    // Centimetres per second. Pairwise differences remain observable after
+    // subtracting the ego velocity in the UE -> ROS relative-velocity field.
+    const double Direction = (Seed % 2 == 0) ? 1.0 : -1.0;
+    Result.Add(TEXT("target_red"), FVector(0.0, 12.0 * Direction, 0.0));
+    Result.Add(TEXT("target_blue"), FVector(0.0, -9.0 * Direction, 0.0));
+    Result.Add(TEXT("target_left"), FVector(7.0 * Direction, 3.0, 0.0));
+    Result.Add(TEXT("target_right"), FVector(-5.0 * Direction, -4.0, 0.0));
+    return Result;
+}
+
+TMap<FName, FSceneSineParams> MakeSineParams(
+    const FString& MotionState,
+    const FString& LayoutId,
+    int32 Seed,
+    double ForwardSpeedCmPerSec,
+    double PeakAmplitudeCm)
+{
+    TMap<FName, FSceneSineParams> Result;
+    if (MotionState != TEXT("S2"))
+    {
+        return Result;
+    }
+    // Phase and direction derive from the seed so runs vary while the
+    // formation stays deterministic per seed.
+    const double Direction = (Seed % 2 == 0) ? 1.0 : -1.0;
+    const double PhaseRad =
+        Direction * (double)(Seed % 360) * PI / 180.0;
+    // The red/blue pair rides the sine on opposite sides of the center line.
+    // Each boat swings with half the peak amplitude so the formation's total
+    // lateral extent stays within the configured peak. The white boats
+    // advance straight ahead as distractors (zero lateral amplitude). L6/L7
+    // put red left of blue; mirrored L6B/L7B swap the sine offsets.  L7's
+    // near-range pair is 2 m apart (+/-100 cm), L6's far pair 6 m apart.
+    double RedOffsetCm = -300.0;
+    double BlueOffsetCm = 300.0;
+    if (LayoutId == TEXT("L7"))
+    {
+        RedOffsetCm = -100.0;
+        BlueOffsetCm = 100.0;
+    }
+    else if (LayoutId == TEXT("L6B"))
+    {
+        RedOffsetCm = 300.0;
+        BlueOffsetCm = -300.0;
+    }
+    else if (LayoutId == TEXT("L7B"))
+    {
+        RedOffsetCm = 100.0;
+        BlueOffsetCm = -100.0;
+    }
+    FSceneSineParams Red;
+    Red.ForwardSpeedCmPerSec = ForwardSpeedCmPerSec;
+    Red.LateralOffsetCm = RedOffsetCm;
+    Red.AmplitudeCm = PeakAmplitudeCm / 2.0;
+    Red.PhaseRad = PhaseRad;
+    Result.Add(TEXT("target_red"), Red);
+
+    FSceneSineParams Blue = Red;
+    Blue.LateralOffsetCm = BlueOffsetCm;
+    Result.Add(TEXT("target_blue"), Blue);
+
+    FSceneSineParams White = Red;
+    White.LateralOffsetCm = 0.0;
+    White.AmplitudeCm = 0.0;
+    Result.Add(TEXT("target_left"), White);
+    Result.Add(TEXT("target_right"), White);
+    return Result;
+}
+} // namespace
+
+bool USceneAutomationSubsystem::ShouldCreateSubsystem(UObject* Outer) const
+{
+    if (!FParse::Param(FCommandLine::Get(), TEXT("SceneAuto")))
+    {
+        return false;
+    }
+    const UWorld* World = Cast<UWorld>(Outer);
+    return World != nullptr
+        && (World->WorldType == EWorldType::Game
+            || World->WorldType == EWorldType::PIE);
+}
+
+void USceneAutomationSubsystem::OnWorldBeginPlay(UWorld& InWorld)
+{
+    Super::OnWorldBeginPlay(InWorld);
+    if (!ReadCommandLine() || !ConfigureScene())
+    {
+        return;
+    }
+    bConfigured = true;
+    UE_LOG(
+        LogSceneAutomation,
+        Display,
+        TEXT("SCENE_RENDER_WARMUP_REQUIRED seconds=%.2f"),
+        RenderWarmupSeconds);
+    if (MotionState == TEXT("S2"))
+    {
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_SINE_PARAMS wavelength_cm=%.0f amplitude_cm=%.0f speed_cm_s=%.0f"),
+            SineWavelengthCm,
+            SineAmplitudeCm,
+            SineSpeedCmPerSec);
+    }
+}
+
+bool USceneAutomationSubsystem::ReadCommandLine()
+{
+    const TCHAR* CommandLine = FCommandLine::Get();
+    if (!FParse::Value(CommandLine, TEXT("Slot="), SlotId)
+        || !FParse::Value(CommandLine, TEXT("Layout="), LayoutId)
+        || !FParse::Value(CommandLine, TEXT("Motion="), MotionState)
+        || !FParse::Value(CommandLine, TEXT("Seed="), SceneSeed))
+    {
+        FailAndExit(TEXT("missing slot/layout/motion/seed command-line argument"));
+        return false;
+    }
+    FParse::Value(
+        CommandLine,
+        TEXT("MaxRuntimeSeconds="),
+        MaxRuntimeSeconds);
+    FParse::Value(
+        CommandLine,
+        TEXT("RenderWarmupSeconds="),
+        RenderWarmupSeconds);
+    // Optional sine-formation parameters (motion S2); defaults are the
+    // demo configuration (wavelength 60 m, peak amplitude 6 m, 0.6 m/s).
+    FParse::Value(CommandLine, TEXT("SineWavelength="), SineWavelengthCm);
+    FParse::Value(CommandLine, TEXT("SineAmplitude="), SineAmplitudeCm);
+    FParse::Value(CommandLine, TEXT("SineSpeed="), SineSpeedCmPerSec);
+    FParse::Value(CommandLine, TEXT("SineDelay="), SineDelaySec);
+    bYawFixWholeRun = FParse::Param(FCommandLine::Get(), TEXT("YawFixWholeRun"));
+    FString ExpertColor;
+    if (FParse::Value(CommandLine, TEXT("ExpertFollowColor="), ExpertColor))
+    {
+        ExpertColor.TrimStartAndEndInline();
+        ExpertColor.ToLowerInline();
+        if (ExpertColor == TEXT("red"))
+        {
+            ExpertFollowEntityId = TEXT("target_red");
+        }
+        else if (ExpertColor == TEXT("blue"))
+        {
+            ExpertFollowEntityId = TEXT("target_blue");
+        }
+        else
+        {
+            FailAndExit(TEXT("ExpertFollowColor must be red or blue"));
+            return false;
+        }
+        bExpertFollowEnabled = true;
+        FParse::Value(CommandLine, TEXT("ExpertStandoffM="), ExpertStandoffM);
+        FParse::Value(CommandLine, TEXT("ExpertMaxStepCm="), ExpertMaxStepCm);
+        FParse::Value(
+            CommandLine,
+            TEXT("ExpertMaxAccelerationCmPerSec2="),
+            ExpertMaxAccelerationCmPerSec2);
+    }
+    FParse::Value(CommandLine, TEXT("SceneExecPort="), ExecPort);
+    FParse::Value(CommandLine, TEXT("ObjectDelivererHost="), ObjectDelivererHost);
+    if (ExecPort > 0 || bExpertFollowEnabled)
+    {
+        // Apply setpoint displacements after the whole world tick so the
+        // executor wins over any blueprint-side position control.
+        WorldTickEndHandle = FWorldDelegates::OnWorldTickEnd.AddLambda(
+            [this](UWorld*, ELevelTick, float)
+            {
+                ApplyExecutedOffset();
+            });
+    }
+    if (SlotId.IsEmpty()
+        || !LayoutId.StartsWith(TEXT("L"))
+        || (MotionState != TEXT("S0")
+            && MotionState != TEXT("S1")
+            && MotionState != TEXT("S2"))
+        || SceneSeed < 1
+        || MaxRuntimeSeconds < 10.0F
+        || RenderWarmupSeconds < 0.0F
+        || SineWavelengthCm < 1000.0
+        || SineAmplitudeCm < 100.0
+        || SineSpeedCmPerSec <= 0.0)
+    {
+        FailAndExit(TEXT("invalid slot/layout/motion/seed/runtime argument"));
+        return false;
+    }
+    if (bExpertFollowEnabled
+        && (ExpertStandoffM <= 0.0F
+            || ExpertMaxStepCm <= 0.0F
+            || ExpertMaxAccelerationCmPerSec2 <= 0.0F))
+    {
+        FailAndExit(TEXT("invalid expert follow parameters"));
+        return false;
+    }
+    return true;
+}
+
+void USceneAutomationSubsystem::ForceAsvYawZero(AActor& Asv) const
+{
+    Asv.SetActorLocationAndRotation(
+        Asv.GetActorLocation(),
+        FRotator(0.0, 0.0, 0.0),
+        false,
+        nullptr,
+        ETeleportType::TeleportPhysics);
+}
+
+AActor* USceneAutomationSubsystem::FindUniqueActorByClassName(
+    const TCHAR* ClassName) const
+{
+    AActor* Match = nullptr;
+    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+    {
+        if (It->GetClass()->GetName() != ClassName)
+        {
+            continue;
+        }
+        if (Match != nullptr)
+        {
+            UE_LOG(
+                LogSceneAutomation,
+                Error,
+                TEXT("Duplicate actor class required by scene automation: %s"),
+                ClassName);
+            return nullptr;
+        }
+        Match = *It;
+    }
+    return Match;
+}
+
+bool USceneAutomationSubsystem::SetBlueprintInteger(
+    AActor& Actor,
+    const FString& LogicalName,
+    int64 Value) const
+{
+    const FString Wanted = NormalizePropertyName(LogicalName);
+    for (TFieldIterator<FProperty> It(Actor.GetClass()); It; ++It)
+    {
+        FProperty* Property = *It;
+        if (NormalizePropertyName(Property->GetName()) != Wanted)
+        {
+            continue;
+        }
+        FNumericProperty* Numeric = CastField<FNumericProperty>(Property);
+        if (Numeric == nullptr || !Numeric->IsInteger())
+        {
+            UE_LOG(
+                LogSceneAutomation,
+                Error,
+                TEXT("%s.%s exists but is not an integer"),
+                *Actor.GetName(),
+                *Property->GetName());
+            return false;
+        }
+        void* ValueAddress = Property->ContainerPtrToValuePtr<void>(&Actor);
+        Numeric->SetIntPropertyValue(ValueAddress, Value);
+        return true;
+    }
+    UE_LOG(
+        LogSceneAutomation,
+        Error,
+        TEXT("%s has no Blueprint integer property matching %s"),
+        *Actor.GetName(),
+        *LogicalName);
+    return false;
+}
+
+bool USceneAutomationSubsystem::SetBlueprintString(
+    AActor& Actor,
+    const FString& LogicalName,
+    const FString& Value) const
+{
+    const FString Wanted = NormalizePropertyName(LogicalName);
+    for (TFieldIterator<FProperty> It(Actor.GetClass()); It; ++It)
+    {
+        FProperty* Property = *It;
+        if (NormalizePropertyName(Property->GetName()) != Wanted)
+        {
+            continue;
+        }
+        FStrProperty* StringProperty = CastField<FStrProperty>(Property);
+        if (StringProperty == nullptr)
+        {
+            UE_LOG(
+                LogSceneAutomation,
+                Error,
+                TEXT("%s.%s exists but is not a string"),
+                *Actor.GetName(),
+                *Property->GetName());
+            return false;
+        }
+        void* ValueAddress = Property->ContainerPtrToValuePtr<void>(&Actor);
+        StringProperty->SetPropertyValue(ValueAddress, Value);
+        return true;
+    }
+    UE_LOG(
+        LogSceneAutomation,
+        Warning,
+        TEXT("%s has no Blueprint string property matching %s"),
+        *Actor.GetName(),
+        *LogicalName);
+    return false;
+}
+
+bool USceneAutomationSubsystem::ConfigureScene()
+{
+    AActor* Asv = FindUniqueActorByClassName(TEXT("BP_ASV_C"));
+    AActor* Connection = FindUniqueActorByClassName(TEXT("Connection_C"));
+    if (Asv == nullptr || Connection == nullptr)
+    {
+        FailAndExit(TEXT("BP_ASV_C or Connection_C is missing/duplicated"));
+        return false;
+    }
+    if (!SetBlueprintInteger(*Connection, TEXT("SceneSeed"), SceneSeed))
+    {
+        FailAndExit(TEXT("cannot set Connection.SceneSeed before BeginPlay"));
+        return false;
+    }
+    if (!ObjectDelivererHost.IsEmpty())
+    {
+        SetBlueprintString(*Connection, TEXT("IpAddress"), ObjectDelivererHost);
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_DELIVERER_HOST host=%s"),
+            *ObjectDelivererHost);
+    }
+
+    // Canonical camera-facing pose.  The Connection blueprint consumes
+    // SceneSeed and spawns/rotates the ASV afterwards (seed 200101 produced
+    // yaw=180 deg, leaving the targets behind the camera).  Force yaw=0
+    // before placing targets and re-assert it in Tick (all BP_ASV_C actors)
+    // for the first kAsvYawFixWindowSec so the scene is deterministic
+    // regardless of BeginPlay ordering.
+    ForceAsvYawZero(*Asv);
+    AsvActor = Asv;
+    if (!bHaveInitialAsvLocation)
+    {
+        InitialAsvLocation = Asv->GetActorLocation();
+        bHaveInitialAsvLocation = true;
+    }
+    else
+    {
+        Asv->SetActorLocationAndRotation(
+            InitialAsvLocation,
+            FRotator(0.0, 0.0, 0.0),
+            false,
+            nullptr,
+            ETeleportType::TeleportPhysics);
+    }
+    AsvAnchorLocation = Asv->GetActorLocation();
+    UE_LOG(
+        LogSceneAutomation,
+        Display,
+        TEXT("SCENE_ASV_ANCHOR name=%s loc=%s yaw=%d"),
+        *Asv->GetName(),
+        *Asv->GetActorLocation().ToString(),
+        (int32)FMath::RoundToInt(Asv->GetActorRotation().Yaw));
+
+    TMap<FName, FVector> LocalLocations;
+    if (!MakeLayout(LayoutId, LocalLocations))
+    {
+        FailAndExit(FString::Printf(TEXT("unsupported layout %s"), *LayoutId));
+        return false;
+    }
+
+    TargetActors.Reset();
+    for (const FTargetBinding& Binding : TargetBindings)
+    {
+        AActor* Target = FindUniqueActorByClassName(Binding.BlueprintClassName);
+        if (Target == nullptr)
+        {
+            FailAndExit(
+                FString::Printf(
+                    TEXT("required target class %s is missing/duplicated"),
+                    Binding.BlueprintClassName));
+            return false;
+        }
+        TargetActors.Add(Binding.EntityId, Target);
+    }
+
+    FRandomStream Random(SceneSeed);
+    const FTransform AsvTransform = Asv->GetActorTransform();
+    const TMap<FName, FVector> LocalVelocities =
+        MakeLocalVelocities(MotionState, SceneSeed);
+    SineParams = MakeSineParams(
+        MotionState, LayoutId, SceneSeed, SineSpeedCmPerSec, SineAmplitudeCm);
+
+    for (const FTargetBinding& Binding : TargetBindings)
+    {
+        AActor* Target = TargetActors[Binding.EntityId].Get();
+        check(Target != nullptr);
+
+        FVector Local = LocalLocations[Binding.EntityId];
+        // Seed-dependent but relation-preserving nuisance variation.
+        Local.X += Random.FRandRange(-15.0F, 15.0F);
+        Local.Y += Random.FRandRange(-15.0F, 15.0F);
+
+        FVector WorldLocation = AsvTransform.TransformPositionNoScale(Local);
+        WorldLocation.Z = Target->GetActorLocation().Z;
+        const FVector WorldVelocity = AsvTransform.TransformVectorNoScale(
+            LocalVelocities[Binding.EntityId]);
+
+        InitialWorldLocations.Add(Binding.EntityId, WorldLocation);
+        InitialWorldRotations.Add(Binding.EntityId, Target->GetActorRotation());
+        WorldVelocitiesCmPerSecond.Add(Binding.EntityId, WorldVelocity);
+        Target->SetActorLocationAndRotation(
+            WorldLocation,
+            Target->GetActorRotation(),
+            false,
+            nullptr,
+            ETeleportType::TeleportPhysics);
+    }
+    return true;
+}
+
+int32 USceneAutomationSubsystem::WarmupSceneCaptures()
+{
+    int32 CapturedComponentCount = 0;
+    if (GetWorld() == nullptr)
+    {
+        return CapturedComponentCount;
+    }
+
+    // Explicitly render the current post-BeginPlay scene before advertising
+    // readiness.  This covers captures that are not configured for automatic
+    // capture and avoids making the first external request race map startup.
+    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+    {
+        TArray<USceneCaptureComponent2D*> CaptureComponents;
+        It->GetComponents<USceneCaptureComponent2D>(CaptureComponents);
+        for (USceneCaptureComponent2D* Capture : CaptureComponents)
+        {
+            if (!IsValid(Capture)
+                || !Capture->IsRegistered()
+                || !IsValid(Capture->TextureTarget.Get()))
+            {
+                continue;
+            }
+
+            // Capture display-referred, tone-mapped color while preserving the
+            // Scene Capture and Render Target settings authored in UE5.
+            Capture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+            Capture->ShowFlags.SetPostProcessing(true);
+            Capture->ShowFlags.SetTonemapper(true);
+            Capture->CaptureScene();
+            ++CapturedComponentCount;
+        }
+    }
+    FlushRenderingCommands();
+    return CapturedComponentCount;
+}
+
+void USceneAutomationSubsystem::Tick(float DeltaTime)
+{
+    if (!bConfigured || bExitRequested)
+    {
+        return;
+    }
+    RetargetObjectDeliverer();
+    ElapsedSeconds += DeltaTime;
+    if (!bReadyEmitted && ElapsedSeconds >= RenderWarmupSeconds)
+    {
+        const int32 CapturedComponentCount = WarmupSceneCaptures();
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_CAPTURE_WARMUP captures=%d elapsed_seconds=%.2f"),
+            CapturedComponentCount,
+            ElapsedSeconds);
+        bReadyEmitted = true;
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_UE_READY slot=%s layout=%s motion=%s scene_seed=%d warmup_seconds=%.2f"),
+            *SlotId,
+            *LayoutId,
+            *MotionState,
+            SceneSeed,
+            RenderWarmupSeconds);
+        if (MotionState == TEXT("S2"))
+        {
+            UE_LOG(
+                LogSceneAutomation,
+                Display,
+                TEXT("SCENE_SINE_PARAMS wavelength_cm=%.0f amplitude_cm=%.0f speed_cm_s=%.0f"),
+                SineWavelengthCm,
+                SineAmplitudeCm,
+                SineSpeedCmPerSec);
+        }
+    }
+    if (ElapsedSeconds < kAsvYawFixWindowSec || bYawFixWholeRun)
+    {
+        // Undo seed-driven ASV rotation(s) applied at/after BeginPlay.  The
+        // Connection blueprint may spawn its own BP_ASV after ConfigureScene,
+        // so fix every BP_ASV_C in the world.  Stops once kinematic setpoints
+        // may move the ship, so it does not fight the executor.  With
+        // YawFixWholeRun the fix persists to suppress the blueprint's
+        // mid-run 180 deg flip (observed under a setpoint stream).
+        int32 AsvCount = 0;
+        for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+        {
+            if (It->GetClass()->GetName() != TEXT("BP_ASV_C"))
+            {
+                continue;
+            }
+            ForceAsvYawZero(**It);
+            ++AsvCount;
+        }
+        // Diagnostics: sample the world state once per second while fixing.
+        if (FMath::FloorToInt(ElapsedSeconds) != LastYawSampleSecond)
+        {
+            LastYawSampleSecond = FMath::FloorToInt(ElapsedSeconds);
+            UE_LOG(
+                LogSceneAutomation,
+                Display,
+                TEXT("SCENE_YAW_FIX t=%.2f asv_count=%d"),
+                ElapsedSeconds,
+                AsvCount);
+        }
+    }
+    for (const FTargetBinding& Binding : TargetBindings)
+    {
+        AActor* Target = TargetActors[Binding.EntityId].Get();
+        if (Target == nullptr)
+        {
+            FailAndExit(
+                FString::Printf(
+                    TEXT("target actor disappeared: %s"),
+                    *Binding.EntityId.ToString()));
+            return;
+        }
+        FVector Location;
+        if (const FSceneSineParams* Params = SineParams.Find(Binding.EntityId))
+        {
+            // Analytic world-frame sine: the formation advances along X and
+            // each boat oscillates laterally about its center-line offset.
+            // The formation holds its spawn position for SineDelaySec so a
+            // late-starting closed loop still sees training-distance inputs.
+            const double MotionTime =
+                FMath::Max(0.0, ElapsedSeconds - SineDelaySec);
+            const double X =
+                InitialWorldLocations[Binding.EntityId].X
+                + Params->ForwardSpeedCmPerSec * MotionTime;
+            // The layout already encodes each boat's lateral offset from the
+            // formation center line; the sine only adds the swing around it
+            // (adding LateralOffsetCm again would double the pair gap).
+            const double Y =
+                InitialWorldLocations[Binding.EntityId].Y
+                + Params->AmplitudeCm
+                    * FMath::Sin(
+                        2.0 * PI * Params->ForwardSpeedCmPerSec
+                            * MotionTime / SineWavelengthCm
+                        + Params->PhaseRad);
+            Location = FVector(X, Y, InitialWorldLocations[Binding.EntityId].Z);
+        }
+        else
+        {
+            Location =
+                InitialWorldLocations[Binding.EntityId]
+                + WorldVelocitiesCmPerSecond[Binding.EntityId] * ElapsedSeconds;
+        }
+        Target->SetActorLocationAndRotation(
+            Location,
+            InitialWorldRotations[Binding.EntityId],
+            false,
+            nullptr,
+            ETeleportType::TeleportPhysics);
+    }
+    if (bExpertFollowEnabled)
+    {
+        ApplyExpertFollow(DeltaTime);
+    }
+    // Diagnostics: sample world positions once per second to verify target
+    // motion and to detect any blueprint-driven ASV drift.
+    if (FMath::FloorToInt(ElapsedSeconds) != LastPosSampleSecond)
+    {
+        LastPosSampleSecond = FMath::FloorToInt(ElapsedSeconds);
+        for (const FTargetBinding& Binding : TargetBindings)
+        {
+            AActor* Target = TargetActors[Binding.EntityId].Get();
+            if (Target == nullptr)
+            {
+                continue;
+            }
+            UE_LOG(
+                LogSceneAutomation,
+                Display,
+                TEXT("SCENE_TARGET_POS t=%.1f entity=%s world=%s"),
+                ElapsedSeconds,
+                *Binding.EntityId.ToString(),
+                *Target->GetActorLocation().ToString());
+        }
+        if (AActor* Asv = AsvActor.Get())
+        {
+            UE_LOG(
+                LogSceneAutomation,
+                Display,
+                TEXT("SCENE_ASV_POS t=%.1f world=%s yaw=%d"),
+                ElapsedSeconds,
+                *Asv->GetActorLocation().ToString(),
+                (int32)FMath::RoundToInt(Asv->GetActorRotation().Yaw));
+        }
+    }
+    PollSetpointExecutor();
+    if (ElapsedSeconds >= MaxRuntimeSeconds && !bExitRequested)
+    {
+        bExitRequested = true;
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_UE_COMPLETE slot=%s layout=%s motion=%s scene_seed=%d runtime_seconds=%.2f"),
+            *SlotId,
+            *LayoutId,
+            *MotionState,
+            SceneSeed,
+            ElapsedSeconds);
+        FPlatformMisc::RequestExit(false);
+    }
+}
+
+void USceneAutomationSubsystem::ApplyExpertFollow(float DeltaTime)
+{
+    AActor* Target = TargetActors.FindRef(ExpertFollowEntityId).Get();
+    AActor* Asv = AsvActor.Get();
+    if (Target == nullptr || Asv == nullptr || DeltaTime <= SMALL_NUMBER)
+    {
+        return;
+    }
+
+    const FVector Relative = Target->GetActorLocation() - Asv->GetActorLocation();
+    const float DistanceCm = FVector2D(Relative.X, Relative.Y).Size();
+    if (DistanceCm <= SMALL_NUMBER)
+    {
+        return;
+    }
+
+    const FVector Radial = FVector(Relative.X, Relative.Y, 0.0F) / DistanceCm;
+    const float ErrorCm = DistanceCm - ExpertStandoffM * 100.0F;
+    const FVector TargetVelocity =
+        (SineParams.Contains(ExpertFollowEntityId))
+            ? FVector(
+                SineParams[ExpertFollowEntityId].ForwardSpeedCmPerSec,
+                0.0F,
+                0.0F)
+            : FVector::ZeroVector;
+    const FVector DesiredVelocity = TargetVelocity + Radial * (0.80F * ErrorCm);
+    const float MaxVelocityChange =
+        ExpertMaxAccelerationCmPerSec2 * DeltaTime;
+    const FVector VelocityDelta = DesiredVelocity - ExpertVelocityCmPerSec;
+    const float DeltaSize = VelocityDelta.Size();
+    if (DeltaSize > MaxVelocityChange)
+    {
+        ExpertVelocityCmPerSec += VelocityDelta * (MaxVelocityChange / DeltaSize);
+    }
+    else
+    {
+        ExpertVelocityCmPerSec = DesiredVelocity;
+    }
+
+    FVector Step = ExpertVelocityCmPerSec * DeltaTime;
+    Step.Z = 0.0F;
+    const float StepSize = FVector2D(Step.X, Step.Y).Size();
+    if (StepSize > ExpertMaxStepCm)
+    {
+        Step *= ExpertMaxStepCm / StepSize;
+    }
+    if (!bExecutorActive)
+    {
+        AsvAnchorLocation = Asv->GetActorLocation();
+    }
+    ExecutedOffset += Step;
+    bExecutorActive = true;
+    ++ExpertApplyCount;
+    if (ExpertApplyCount == 1 || ExpertApplyCount % 25 == 0)
+    {
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_EXPERT_APPLY slot=%s count=%d entity=%s dx_cm=%.3f dy_cm=%.3f distance_m=%.3f error_m=%.3f"),
+            *SlotId,
+            ExpertApplyCount,
+            *ExpertFollowEntityId.ToString(),
+            Step.X,
+            Step.Y,
+            DistanceCm / 100.0F,
+            ErrorCm / 100.0F);
+    }
+}
+
+void USceneAutomationSubsystem::PollSetpointExecutor()
+{
+    if (ExecPort <= 0)
+    {
+        return;
+    }
+    if (ExecServerSocket == nullptr)
+    {
+        ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get();
+        if (SocketSubsystem == nullptr)
+        {
+            return;
+        }
+        ExecServerSocket = SocketSubsystem->CreateSocket(
+            NAME_Stream, TEXT("SceneSetpointExecutor"), false);
+        if (ExecServerSocket == nullptr)
+        {
+            UE_LOG(
+                LogSceneAutomation,
+                Error,
+                TEXT("SCENE_EXEC_FAIL cannot create socket"));
+            return;
+        }
+        ExecServerSocket->SetNonBlocking(true);
+        FIPv4Endpoint Endpoint(FIPv4Address::Any, ExecPort);
+        if (!ExecServerSocket->Bind(*Endpoint.ToInternetAddr())
+            || !ExecServerSocket->Listen(4))
+        {
+            UE_LOG(
+                LogSceneAutomation,
+                Error,
+                TEXT("SCENE_EXEC_FAIL cannot bind/listen port %d"),
+                ExecPort);
+            ExecServerSocket->Close();
+            ExecServerSocket = nullptr;
+            return;
+        }
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_EXEC_READY port=%d"),
+            ExecPort);
+    }
+
+    // Accept a client if none is connected.  Do not replace a live trainer
+    // socket when a second connector (typically Jetson) also hits 8081.
+    FSocket* NewClient = ExecServerSocket->Accept(TEXT("SceneSetpointClient"));
+    if (NewClient != nullptr)
+    {
+        if (ExecClientSocket != nullptr)
+        {
+            NewClient->Close();
+            ISocketSubsystem::Get()->DestroySocket(NewClient);
+        }
+        else
+        {
+            NewClient->SetNonBlocking(true);
+            ExecClientSocket = NewClient;
+            UE_LOG(
+                LogSceneAutomation,
+                Display,
+                TEXT("SCENE_EXEC_CLIENT_CONNECTED"));
+        }
+    }
+
+    if (ExecClientSocket == nullptr)
+    {
+        return;
+    }
+
+    // Drain available bytes and split on the __OD_END__ terminator.
+    uint8 Chunk[4096];
+    int32 BytesRead = 0;
+    while (ExecClientSocket->Recv(
+               Chunk, sizeof(Chunk), BytesRead,
+               ESocketReceiveFlags::None)
+           && BytesRead > 0)
+    {
+        ExecBuffer.Append(Chunk, BytesRead);
+    }
+    static const TArray<uint8> Terminator = []() {
+        const FString T = TEXT("__OD_END__");
+        TArray<uint8> Out;
+        Out.Reserve(T.Len());
+        for (int32 i = 0; i < T.Len(); ++i)
+        {
+            Out.Add(static_cast<uint8>(T[i]));
+        }
+        return Out;
+    }();
+    const auto FindTerminator = [&]() -> int32 {
+        if (ExecBuffer.Num() < Terminator.Num())
+        {
+            return INDEX_NONE;
+        }
+        for (int32 i = 0; i + Terminator.Num() <= ExecBuffer.Num(); ++i)
+        {
+            bool Match = true;
+            for (int32 j = 0; j < Terminator.Num(); ++j)
+            {
+                if (ExecBuffer[i + j] != Terminator[j])
+                {
+                    Match = false;
+                    break;
+                }
+            }
+            if (Match)
+            {
+                return i;
+            }
+        }
+        return INDEX_NONE;
+    };
+    int32 Found = INDEX_NONE;
+    while ((Found = FindTerminator()) != INDEX_NONE)
+    {
+        const FUTF8ToTCHAR Converter(
+            reinterpret_cast<const ANSICHAR*>(ExecBuffer.GetData()),
+            Found);
+        // The converter is length-bounded because the bridge frame is
+        // terminated by a marker and a NUL byte, not by a JSON C string.
+        // Construct FString with the converted length rather than relying
+        // on Converter.Get() being NUL-terminated.
+        const FString Payload(Converter.Length(), Converter.Get());
+        HandleSetpointPayload(Payload);
+        ExecBuffer.RemoveAt(0, Found + Terminator.Num());
+        // The bridge appends a NUL separator after the terminator; drop it
+        // so the next payload does not start with a truncated string.
+        while (ExecBuffer.Num() > 0 && ExecBuffer[0] == 0)
+        {
+            ExecBuffer.RemoveAt(0, 1);
+        }
+    }
+}
+
+void USceneAutomationSubsystem::HandleSetpointPayload(const FString& Payload)
+{
+    TSharedPtr<FJsonObject> Object;
+    const TSharedRef<TJsonReader<>> Reader =
+        TJsonReaderFactory<>::Create(Payload);
+    if (!FJsonSerializer::Deserialize(Reader, Object) || !Object.IsValid())
+    {
+        UE_LOG(
+            LogSceneAutomation,
+            Warning,
+            TEXT("SCENE_EXEC_BAD_PAYLOAD len=%d error=%s payload=%s"),
+            Payload.Len(),
+            *Reader->GetErrorMessage(),
+            *Payload.Left(120));
+        return;
+    }
+    bool Reset = false;
+    if (Object->TryGetBoolField(TEXT("Reset"), Reset) && Reset)
+    {
+        int32 NewSeed = SceneSeed;
+        double SeedNumber = 0.0;
+        if (Object->TryGetNumberField(TEXT("Seed"), SeedNumber)
+            && FMath::IsFinite(SeedNumber))
+        {
+            NewSeed = static_cast<int32>(SeedNumber);
+        }
+        FString NewSlot;
+        if (Object->TryGetStringField(TEXT("Slot"), NewSlot) && !NewSlot.IsEmpty())
+        {
+            SlotId = NewSlot;
+        }
+        ResetEpisode(NewSeed);
+        return;
+    }
+    bool Valid = false;
+    bool Hold = false;
+    if (!Object->TryGetBoolField(TEXT("Valid"), Valid)
+        || !Object->TryGetBoolField(TEXT("Hold_Position"), Hold))
+    {
+        UE_LOG(
+            LogSceneAutomation,
+            Warning,
+            TEXT("SCENE_EXEC_BAD_PAYLOAD len=%d missing_or_invalid_bool payload=%s"),
+            Payload.Len(),
+            *Payload.Left(120));
+        return;
+    }
+    if (!Valid || Hold)
+    {
+        return;
+    }
+    double DeltaX = 0.0;
+    double DeltaY = 0.0;
+    if (!Object->TryGetNumberField(TEXT("Delta_X_Cm"), DeltaX)
+        || !Object->TryGetNumberField(TEXT("Delta_Y_Cm"), DeltaY)
+        || !FMath::IsFinite(DeltaX)
+        || !FMath::IsFinite(DeltaY))
+    {
+        UE_LOG(
+            LogSceneAutomation,
+            Warning,
+            TEXT("SCENE_EXEC_BAD_PAYLOAD len=%d missing_or_invalid_delta payload=%s"),
+            Payload.Len(),
+            *Payload.Left(120));
+        return;
+    }
+    AActor* Asv = AsvActor.Get();
+    if (Asv == nullptr)
+    {
+        return;
+    }
+    if (!bExecutorActive)
+    {
+        // First setpoint: take over from the blueprint cruise AT ITS
+        // CURRENT POSITION.  The blueprint has been approaching the
+        // formation (counterbalanced cruise); anchoring the spawn point
+        // would teleport the ASV back and change the camera viewpoint
+        // away from the training distribution.  Anchoring the cruise
+        // position keeps the online viewpoint consistent with collection.
+        AsvAnchorLocation = Asv->GetActorLocation();
+    }
+    ExecutedOffset.X += static_cast<float>(DeltaX);
+    ExecutedOffset.Y += static_cast<float>(DeltaY);
+    bExecutorActive = true;
+
+    // Keep a low-rate proof-of-life in long closed-loop logs without
+    // spamming once per setpoint.
+    static int32 ApplyLogCount = 0;
+    ++ApplyLogCount;
+    if (ApplyLogCount == 1 || ApplyLogCount % 25 == 0)
+    {
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_EXEC_APPLY slot=%s count=%d dx_cm=%.3f dy_cm=%.3f offset=%s"),
+            *SlotId,
+            ApplyLogCount,
+            DeltaX,
+            DeltaY,
+            *ExecutedOffset.ToString());
+    }
+}
+
+void USceneAutomationSubsystem::RetargetObjectDeliverer()
+{
+    if (ObjectDelivererHost.IsEmpty() || bObjectDelivererRetargeted)
+    {
+        return;
+    }
+    int32 Count = 0;
+    for (TObjectIterator<UProtocolTcpIpClient> It; It; ++It)
+    {
+        UProtocolTcpIpClient* Client = *It;
+        if (Client == nullptr || !IsValid(Client))
+        {
+            continue;
+        }
+        const int32 Port = Client->ServerPort > 0 ? Client->ServerPort : 8080;
+        if (Client->ServerIpAddress != ObjectDelivererHost)
+        {
+            Client->Close();
+            Client->Initialize(ObjectDelivererHost, Port, true, true);
+            Client->Start();
+        }
+        ++Count;
+        UE_LOG(
+            LogSceneAutomation,
+            Display,
+            TEXT("SCENE_DELIVERER_RETARGET host=%s port=%d"),
+            *ObjectDelivererHost,
+            Port);
+    }
+    if (Count > 0)
+    {
+        bObjectDelivererRetargeted = true;
+    }
+}
+
+void USceneAutomationSubsystem::ResetEpisode(int32 NewSeed)
+{
+    if (NewSeed >= 1)
+    {
+        SceneSeed = NewSeed;
+    }
+    ElapsedSeconds = 0.0F;
+    ExecutedOffset = FVector::ZeroVector;
+    bExecutorActive = false;
+    ExpertVelocityCmPerSec = FVector::ZeroVector;
+    ExpertApplyCount = 0;
+    if (!ConfigureScene())
+    {
+        return;
+    }
+    UE_LOG(
+        LogSceneAutomation,
+        Display,
+        TEXT("SCENE_UE_RESET slot=%s layout=%s motion=%s scene_seed=%d"),
+        *SlotId,
+        *LayoutId,
+        *MotionState,
+        SceneSeed);
+}
+
+void USceneAutomationSubsystem::ApplyExecutedOffset()
+{
+    if (!bExecutorActive || (!bExpertFollowEnabled && ExecPort <= 0))
+    {
+        return;
+    }
+    AActor* Asv = AsvActor.Get();
+    if (Asv == nullptr)
+    {
+        return;
+    }
+    // The blueprint may reposition the ASV during its own tick; re-assert
+    // the anchor-plus-setpoint position after the whole world tick so the
+    // C++ executor is the effective kinematic controller.
+    Asv->SetActorLocationAndRotation(
+        AsvAnchorLocation + ExecutedOffset,
+        FRotator(0.0, 0.0, 0.0),
+        false,
+        nullptr,
+        ETeleportType::TeleportPhysics);
+}
+
+TStatId USceneAutomationSubsystem::GetStatId() const
+{
+    RETURN_QUICK_DECLARE_CYCLE_STAT(
+        USceneAutomationSubsystem,
+        STATGROUP_Tickables);
+}
+
+void USceneAutomationSubsystem::FailAndExit(const FString& Reason)
+{
+    if (bExitRequested)
+    {
+        return;
+    }
+    bExitRequested = true;
+    UE_LOG(
+        LogSceneAutomation,
+        Error,
+        TEXT("SCENE_UE_FAIL slot=%s reason=%s"),
+        *SlotId,
+        *Reason);
+    FPlatformMisc::RequestExit(false);
+}

@@ -1,0 +1,46 @@
+# Unreal Engine build / editor outputs
+.vs/
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Build/
+*.sln
+*.suo
+*.opensdf
+*.user
+*.userprefs
+Thumbs.db
+.DS_Store
+
+# Local agent / machine handover (do not publish)
+AGENTS.md
+WORKSPACE_CONTEXT.md
+.cursor/
+.vscode/
+.idea/
+
+# Editor user folders and USD import staging
+Content/Developers/
+Content/Collections/
+Content/Python/
+Content/Assets/
+
+# Local one-off scripts
+scripts/
+tools/rebuild_ocean_water.py
+tools/rename_chinese_assets.py
+tools/rebuild_asset_manifest.py
+docs/assets/_*.py
+
+# Generated asset inventory (not needed at runtime)
+ASSET_MANIFEST.json
+
+# Plugin / tool caches
+Plugins/**/__pycache__/
+tools/__pycache__/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
