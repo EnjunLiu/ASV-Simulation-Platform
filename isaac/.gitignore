@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .venv/
+lab/runtime_assets/
 
 # Generated captures and logs
 captures/

@@ -5,9 +5,10 @@ platform models a six-degree-of-freedom rigid hull, mesh-based buoyancy,
 added-mass and quadratic hydrodynamic forces, waves, damping and reversible
 twin propellers applied at their physical locations.
 
-This directory is intentionally simulation-only. It contains no VLA runtime,
-training code, model weights, datasets, acceptance logs or low-level controller
-implementation.
+This directory is intentionally simulation-only. It contains no deployed VLA
+runtime, model weights, datasets, acceptance logs or low-level controller
+implementation. The `lab/` subproject contains the public Isaac Lab task used
+for policy fine-tuning; its runtime artifacts remain local and Git-ignored.
 
 ## Contents
 
@@ -17,6 +18,8 @@ implementation.
 - `examples/floating_cube.py` and `examples/multi_body.py`: compact buoyancy demonstrations.
 - `exts/`: Isaac extension integration.
 - `config/`: Fast DDS configuration for distributed ROS 2 simulation.
+- `lab/`: installable Isaac Lab `DirectRLEnv`, T1/S2 task model, noisy semantic
+  observations and RSL-RL PPO configuration.
 
 ## Run
 
@@ -43,6 +46,15 @@ target odometry for external modules.
 The main physical parameters are exposed as command-line options: hull mass,
 buoyancy coefficient, drag and added-mass coefficients, heave/horizontal/angular
 damping, propeller spacing and per-propeller thrust limit.
+
+## Isaac Lab policy environment
+
+[`lab/`](lab/README.md) is a separate fast policy-iteration path. It runs four
+parallel T1/S2 environments and preserves the deployment-shaped semantic
+observation, reward, termination/reset logic and PPO profiles. Its planar
+kinematic response is intentionally a throughput-oriented surrogate. It is not
+used as evidence for hydrodynamics, propeller actuation or controller
+acceptance; those claims require `floating_asv.py` in full-dynamics wrench mode.
 
 ## Assets and portability
 

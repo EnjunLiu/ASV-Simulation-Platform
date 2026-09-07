@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools<82", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asv-sim-lab"
+version = "1.0.0"
+description = "Isaac Lab T1/S2 task for ASV semantic-policy fine-tuning"
+requires-python = ">=3.11"
+dependencies = ["gymnasium", "numpy", "torch"]
+
+[tool.setuptools.packages.find]
+where = ["source/asv_sim_lab"]
