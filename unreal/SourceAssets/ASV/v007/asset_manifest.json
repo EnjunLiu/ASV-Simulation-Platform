@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "asset_name": "SM_ASV",
+  "version": "v007",
+  "status": "published",
+  "usd_file": "SM_ASV_v007.usdc",
+  "ue_destination": "/Game/Assets/ASV/_staging",
+  "ue_target_mesh": "/Game/ASVModel/SM_ASV",
+  "unit": "meter",
+  "source_mesh_count": 30,
+  "sha256": {
+    "SM_ASV_v007.usdc": "5c4cc941d1a699da93f00579d38a6bb18b556a7dc85adc5572be5e7138b7911b",
+    "textures/color_FFFFFF.exr": "c5dfbbd4abc7205f279f6ecd4f2dbd148a04d63ad7f79ca6487d89eeb6556716"
+  },
+  "exporter": {
+    "name": "Blender USD exporter",
+    "blender_version": "5.2.0 LTS"
+  }
+}

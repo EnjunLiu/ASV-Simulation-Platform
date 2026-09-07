@@ -11,8 +11,9 @@ implementation.
 ## Contents
 
 - `Content/`: Unreal maps, Blueprints, materials, vessel assets and environments.
+- `SourceAssets/`: project-owned USD sources and manifests for reproducible asset import.
 - `Source/HILSimulation/`: deterministic scene automation, camera projection and image compression.
-- `Plugins/ObjectDeliverer/`: TCP transport used by the Jetson bridge.
+- `Plugins/AssetPipelineMCP/`: project-owned editor automation for the Blender/USD asset pipeline.
 - `Config/`: engine, project and input configuration.
 - `tools/`: project-owned asset import and maintenance utilities.
 - `docs/assets/`: screenshots used by this README.
@@ -51,8 +52,9 @@ than a separate simulation backend.
 ## Requirements and portability
 
 - Windows 11 and Unreal Engine 5.8.
-- ObjectDeliverer, Water, Landmass, HDRI Backdrop and the project-enabled USD plugins.
+- The ObjectDeliverer Marketplace plugin, plus Water, Landmass, HDRI Backdrop and the project-enabled USD plugins.
 - Blender and Omniverse are optional authoring tools; they are not runtime dependencies.
 
-All project-owned runtime assets are stored under this directory. Unreal Engine,
-Marketplace plugins and optional authoring applications remain external installations.
+All project-owned runtime assets and reproducible import sources are stored under
+this directory. Unreal Engine, Marketplace plugins (including ObjectDeliverer)
+and optional authoring applications remain external installations.

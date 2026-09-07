@@ -20,7 +20,6 @@ def _humble_root() -> str | None:
         if parent == cur:
             break
         cur = parent
-    roots.append(r"E:\isaacsim\_build\windows-x86_64\release")
     seen = set()
     for root in roots:
         path = os.path.join(root, tails)

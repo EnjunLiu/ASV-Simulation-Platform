@@ -82,6 +82,18 @@ SM_ASV_SLOT_MATERIALS = {
     "船身白": "/Game/ASVModel/M_HullWhite",
     "螺丝银": "/Game/ASVModel/M_ScrewSilver",
     "螺旋桨蓝": "/Game/ASVModel/M_PropellerBlue",
+    "Hull_Yellow": "/Game/ASVModel/M_HullYellow",
+    "Hull_White": "/Game/ASVModel/M_HullWhite",
+    "Handle_Black": "/Game/ASVModel/M_HandleBlack",
+    "Propeller_Blue": "/Game/ASVModel/M_PropellerBlue",
+    "Base_Plate_Yellow": "/Game/ASVModel/M_BasePlateYellow",
+    "Core_Board_Black": "/Game/ASVModel/M_HandleBlack",
+    "Battery_Matte_Black": "/Game/ASVModel/M_HandleBlack",
+    "Display_Green": "/Game/ASVModel/M_DisplayGreen",
+    "Button_Gray": "/Game/ASVModel/M_ButtonGray",
+    "Camera_Barrel_Black": "/Game/ASVModel/M_HandleBlack",
+    "Camera_Lens_Glass": "/Game/ASVModel/M_HandleBlack",
+    "Screw_Silver": "/Game/ASVModel/M_ScrewSilver",
 }
 
 SM_TARGET_SLOT_MATERIALS = {
@@ -114,6 +126,12 @@ def restore_slot_materials(mesh_path: str, mapping: dict[str, str] | None = None
         slot_name = str(slot.get_editor_property("material_slot_name"))
         mat_path = mapping.get(slot_name)
         if not mat_path:
+            # USD imports encode the material prim path and a generated suffix
+            # in the slot name. Match the stable authored material token so a
+            # reimport never depends on transient /Game/.../_staging materials.
+            matches = [path for token, path in mapping.items() if token in slot_name]
+            mat_path = matches[0] if len(set(matches)) == 1 else None
+        if not mat_path:
             skipped.append(slot_name)
             continue
         material = unreal.load_asset(mat_path)
@@ -145,7 +163,11 @@ def _assign_mesh_if_needed(comp: unreal.StaticMeshComponent, mesh_path: str, mes
         current_path = current.get_path_name().split(".", 1)[0]
     if current is mesh:
         return False
-    if current is None or current_path == mesh_path:
+    if (
+        current is None
+        or current_path == mesh_path
+        or current_path.startswith("/Game/Assets/ASV/_staging/")
+    ):
         comp.set_editor_property("static_mesh", mesh)
         return True
     return False
@@ -208,13 +230,6 @@ def _overwrite_target(source_mesh: unreal.StaticMesh, target_path: str) -> str:
             _bind_blueprints_to_mesh(target_path, live)
         return target_path
 
-    target_asset = unreal.load_asset(target_path)
-    if isinstance(target_asset, unreal.StaticMesh):
-        if editor_assets.consolidate_assets(source_mesh, [target_asset]):
-            if source_path != target_path and editor_assets.does_asset_exist(source_path):
-                editor_assets.rename_asset(source_path, target_path)
-            return target_path
-
     temp_path = f"{target_path}_IMPORTED"
     if editor_assets.does_asset_exist(temp_path):
         editor_assets.delete_asset(temp_path)
@@ -224,7 +239,7 @@ def _overwrite_target(source_mesh: unreal.StaticMesh, target_path: str) -> str:
     if not isinstance(imported, unreal.StaticMesh):
         raise RuntimeError(f"duplicate did not produce a StaticMesh at {temp_path}")
 
-    _replace_blueprint_meshes(target_path, imported)
+    _bind_blueprints_to_mesh(target_path, imported)
     editor_assets.save_asset(temp_path)
 
     backup = f"{target_path}_OLD"
